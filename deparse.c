@@ -131,6 +131,7 @@ static void sqlite_deparse_select(List *tlist, List **retrieved_attrs, deparse_e
 static void sqlite_deparse_case_expr(CaseExpr *node, deparse_expr_cxt *context);
 static void sqlite_deparse_null_if_expr(NullIfExpr *node, deparse_expr_cxt *context);
 static void sqlite_deparse_coalesce_expr(CoalesceExpr *node, deparse_expr_cxt *context);
+static void sqlite_deparse_iocoerce_expr(CoerceViaIO *node, deparse_expr_cxt *context);
 static void sqlite_deparse_from_expr_for_rel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 											 bool use_alias, Index ignore_rel, List **ignore_conds,
 											 List **params_list);
@@ -768,6 +769,24 @@ sqlite_foreign_expr_walker(Node *node,
 				check_type = false;
 			}
 			break;
+		case T_CoerceViaIO:
+			{
+				CoerceViaIO *iocoerce = (CoerceViaIO *) node;
+
+				/*
+				 * Recurse to input subexpression.
+				 */
+				if (!sqlite_foreign_expr_walker((Node *) iocoerce->arg,
+												glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * CoerceViaIO does not introduce a collation byself.
+				 */
+				collation = iocoerce->resultcollid;
+				state = inner_cxt.state != FDW_COLLATE_UNSAFE ? FDW_COLLATE_SAFE : FDW_COLLATE_UNSAFE;
+			}
+			break;
 		case T_CoalesceExpr:
 			{
 				CoalesceExpr *coalesce = (CoalesceExpr *) node;
@@ -841,6 +860,7 @@ sqlite_foreign_expr_walker(Node *node,
 					  || strcmp(opername, "max") == 0
 					  || strcmp(opername, "min") == 0
 					  || strcmp(opername, "array_agg") == 0
+					  || strcmp(opername, "string_agg") == 0
 					  || strcmp(opername, "stddev_pop") == 0
 					  || strcmp(opername, "stddev_samp") == 0
 					  || strcmp(opername, "mode") == 0
@@ -2101,6 +2121,9 @@ sqlite_deparse_expr(Expr *node, deparse_expr_cxt *context)
 		case T_CoalesceExpr:
 			sqlite_deparse_coalesce_expr((CoalesceExpr *) node, context);
 			break;
+		case T_CoerceViaIO:
+			sqlite_deparse_iocoerce_expr((CoerceViaIO *) node, context);
+			break;
 		case T_NullIfExpr:
 			sqlite_deparse_null_if_expr((NullIfExpr *) node, context);
 			break;
@@ -3115,6 +3138,28 @@ sqlite_deparse_coalesce_expr(CoalesceExpr *node, deparse_expr_cxt *context)
 		sqlite_deparse_expr(lfirst(lc), context);
 	}
 	appendStringInfoChar(buf, ')');
+}
+
+/*
+ * Deparse given value::TYPE expression.
+ */
+static void
+sqlite_deparse_iocoerce_expr(CoerceViaIO *node, deparse_expr_cxt *context)
+{
+	StringInfo	 buf = context->buf;
+	HeapTuple	 typeTuple;
+	Form_pg_type pt;
+
+	sqlite_deparse_expr(node->arg, context);
+
+	typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(node->resulttype));
+	if (HeapTupleIsValid(typeTuple))
+	{
+		appendStringInfoString(buf, "::");
+		pt = (Form_pg_type) GETSTRUCT(typeTuple);
+		appendStringInfoString(buf, pt->typname.data);
+	}
+	ReleaseSysCache(typeTuple);
 }
 
 /*
